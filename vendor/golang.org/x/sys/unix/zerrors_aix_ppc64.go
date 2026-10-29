@@ -1026,7 +1026,6 @@ const (
 	VTDLY                         = 0x8000
 	VTIME                         = 0x5
 	VWERSE                        = 0xd
-	WNOHANG                       = 0x1
 	WPARSTART                     = 0x1
 	WPARSTOP                      = 0x2
 	WPARTTYNAME                   = "Global"
