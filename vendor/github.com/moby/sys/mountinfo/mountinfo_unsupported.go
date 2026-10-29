@@ -1,5 +1,5 @@
-//go:build !windows && !linux && !freebsd && !openbsd && !darwin && !aix
-// +build !windows,!linux,!freebsd,!openbsd,!darwin,!aix
+//go:build !windows && !linux && !freebsd && !openbsd && !darwin
+// +build !windows,!linux,!freebsd,!openbsd,!darwin
 
 package mountinfo
 
