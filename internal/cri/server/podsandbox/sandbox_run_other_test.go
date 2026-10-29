@@ -29,7 +29,10 @@ import (
 
 func getRunPodSandboxTestData(_ criconfig.Config) (*runtime.PodSandboxConfig, *imagespec.ImageConfig, func(*testing.T, string, *runtimespec.Spec)) {
 	config := &runtime.PodSandboxConfig{}
-	imageConfig := &imagespec.ImageConfig{}
+	imageConfig := &imagespec.ImageConfig{
+		// sandboxContainerSpecOpts requires at least one of Entrypoint or Cmd.
+		Cmd: []string{"/pause"},
+	}
 	specCheck := func(t *testing.T, id string, spec *runtimespec.Spec) {
 	}
 	return config, imageConfig, specCheck
