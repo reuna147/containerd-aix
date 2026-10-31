@@ -18,13 +18,16 @@ import (
 //
 //	  node       mounted        mounted over  vfs       date        options
 //	-------- ---------------  ---------------  -------  --------  ---------------
-//	         /dev/hd4         /                jfs2     ...       rw,log=/dev/hd8
-//	         /dev/hd1         /home            jfs2     ...       rw,log=/dev/hd8
-//	host     /remote/path     /mnt/nfs         nfs      ...       rw
+//	         /dev/hd4         /                jfs2     Jul  4 12:00   rw,log=/dev/hd8
+//	         /dev/hd1         /home            jfs2     Jul  4 12:00   rw,log=/dev/hd8
+//	host     /remote/path     /mnt/nfs         nfs      Jul  4 12:00   rw
 //
-// The "node" column is blank for local (non-NFS) mounts, which makes a naive
-// fixed-column split unreliable. We use the column headers to locate the field
-// boundaries from the separator line of dashes.
+// The "node" column is blank for local (non-NFS) mounts, and values longer
+// than their column header push subsequent fields to the right, making
+// fixed-column parsing unreliable for long mount points. We split on whitespace
+// instead (the only robust approach on AIX):
+//   - A line that starts with whitespace has no node entry.
+//   - The date is always three words (month day time); options follow.
 func parseMountTable(filter FilterFunc) ([]*Info, error) {
 	out, err := exec.Command("/usr/sbin/mount").Output()
 	if err != nil {
@@ -34,54 +37,18 @@ func parseMountTable(filter FilterFunc) ([]*Info, error) {
 }
 
 // parseMountOutput is factored out for testability.
+//
+// Field layout after whitespace-splitting:
+//   - Line starts with whitespace (no NFS node):
+//     [0]=source  [1]=mountpoint  [2]=vfs  [3..5]=date  [6..]=options
+//   - Line starts with non-whitespace (NFS node present):
+//     [0]=node  [1]=source  [2]=mountpoint  [3]=vfs  [4..6]=date  [7..]=options
 func parseMountOutput(data []byte, filter FilterFunc) ([]*Info, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 
-	// Skip the header line ("node  mounted  mounted over  vfs  ...").
-	if !scanner.Scan() {
+	// Skip the header line and the separator line of dashes.
+	if !scanner.Scan() || !scanner.Scan() {
 		return nil, nil
-	}
-
-	// The second line is a row of dashes that exactly mirrors the column widths.
-	if !scanner.Scan() {
-		return nil, nil
-	}
-	separator := scanner.Text()
-
-	// Derive column start positions from the separator line.
-	// Each column starts at the first '-' of each dash-group.
-	type col struct{ start, end int }
-	var cols []col
-	inDash := false
-	for i, c := range separator {
-		switch {
-		case c == '-' && !inDash:
-			inDash = true
-			cols = append(cols, col{start: i})
-		case c != '-' && inDash:
-			inDash = false
-			cols[len(cols)-1].end = i
-		}
-	}
-	if inDash {
-		cols[len(cols)-1].end = len(separator)
-	}
-
-	// We need at least: node, mounted, mounted-over, vfs, date, options.
-	// Columns: 0=node, 1=mounted(source), 2=mounted-over(target), 3=vfs(type), 4=date, 5=options
-	if len(cols) < 4 {
-		return nil, fmt.Errorf("mountinfo: unexpected /usr/sbin/mount column layout: %q", separator)
-	}
-
-	field := func(line string, c col) string {
-		end := c.end
-		if end > len(line) {
-			end = len(line)
-		}
-		if c.start >= len(line) {
-			return ""
-		}
-		return strings.TrimSpace(line[c.start:end])
 	}
 
 	var infos []*Info
@@ -91,13 +58,41 @@ func parseMountOutput(data []byte, filter FilterFunc) ([]*Info, error) {
 			continue
 		}
 
-		// col 1 = source device/path, col 2 = mountpoint, col 3 = vfs type
-		source := field(line, cols[1])
-		mountpoint := field(line, cols[2])
-		fstype := field(line, cols[3])
+		// Detect whether a node (NFS server) is present by checking whether
+		// the line starts with whitespace.
+		hasNode := len(line) > 0 && line[0] != ' ' && line[0] != '\t'
+
+		fields := strings.Fields(line)
+
+		// Minimum fields required: source, mountpoint, vfs, and 3 date words.
+		// With node: 7 fields minimum. Without node: 6 fields minimum.
+		minFields := 6
+		if hasNode {
+			minFields = 7
+		}
+		if len(fields) < minFields {
+			continue
+		}
+
+		var source, mountpoint, fstype string
+		var optionsIdx int
+		if hasNode {
+			// fields: [node, source, mountpoint, vfs, d1, d2, d3, options...]
+			source = fields[1]
+			mountpoint = fields[2]
+			fstype = fields[3]
+			optionsIdx = 7
+		} else {
+			// fields: [source, mountpoint, vfs, d1, d2, d3, options...]
+			source = fields[0]
+			mountpoint = fields[1]
+			fstype = fields[2]
+			optionsIdx = 6
+		}
+
 		var options string
-		if len(cols) >= 6 {
-			options = field(line, cols[5])
+		if len(fields) > optionsIdx {
+			options = strings.Join(fields[optionsIdx:], ",")
 		}
 
 		if source == "" || mountpoint == "" {
@@ -126,10 +121,8 @@ func parseMountOutput(data []byte, filter FilterFunc) ([]*Info, error) {
 	return infos, scanner.Err()
 }
 
-// mounted reports whether the given path is a mount point by checking whether
-// its device differs from its parent's — the same stat-based heuristic used by
-// the unix backend. Works for namefs because each namefs mount is a distinct
-// vnode with its own device number.
+// mounted reports whether the given path is a mount point by checking the
+// mount table for an exact mountpoint match.
 func mounted(path string) (bool, error) {
 	entries, err := GetMounts(SingleEntryFilter(path))
 	if err != nil {

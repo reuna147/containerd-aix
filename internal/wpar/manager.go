@@ -136,7 +136,18 @@ func (m *Manager) Start(ctx context.Context, params *bootapi.BootstrapParams) (*
 		"-id", id,
 		"-address", params.GetContainerdGrpcAddress(),
 	)
-	cmd.Dir = "/" // Never use the bundle dir (issue 16)
+	// The shim server must start in the bundle directory. pkg/shim opens the
+	// "log" FIFO relative to its working directory (shim.go: fifo.OpenFifo
+	// opens "log" without an absolute path). containerd sets cwd to the bundle
+	// dir before calling Start; inherit it with os.Getwd().
+	cwd, err := os.Getwd()
+	if err != nil {
+		socketFile.Close()
+		socket.Close()
+		_ = shim.RemoveSocket(address)
+		return nil, fmt.Errorf("getwd for shim bundle dir: %w", err)
+	}
+	cmd.Dir = cwd
 	cmd.Stdout = nil
 	// Do NOT inherit the start process's stderr. containerd reads everything the
 	// "start" binary prints on stdout+stderr as the bootstrap result
@@ -165,6 +176,10 @@ func (m *Manager) Start(ctx context.Context, params *bootapi.BootstrapParams) (*
 	// Close our copies — the child has its own inherited fds.
 	socketFile.Close()
 	shimLog.Close()
+	// Call SetUnlinkOnClose(false) before closing the listener. net.UnixListener
+	// deletes the socket file on Close by default, which would leave containerd
+	// with nothing to dial. The child server is the owner from here on.
+	socket.SetUnlinkOnClose(false)
 	socket.Close()
 
 	// Detach the child wait; we do not track the server PID in the manager.

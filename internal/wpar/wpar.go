@@ -423,65 +423,50 @@ func (w *WPAR) createFast(ctx context.Context) error {
 // finds in /etc/filesystems. Without this step, -p either fails or attaches
 // the template's stanzas (which point to the wrong directory).
 func (w *WPAR) writeFilesystemsStanzas(baseDir string) error {
+	// Stanza names must be full mount-point paths so that mkwpar -p and rmwpar
+	// can locate them.  The "type" field must be the WPAR name (not "wpar") so
+	// that rmwpar recognises and cleans up the stanzas.  "mount = true" means
+	// "mount at boot from the global environment", which is wrong for WPAR
+	// stanzas — omit it.
+	mp := "/wpars/" + w.name
 	stanzas := "\n" +
-		w.name + ":\n" +
+		mp + ":\n" +
 		"\tdev\t\t= " + baseDir + "\n" +
 		"\tvfs\t\t= namefs\n" +
-		"\tmount\t\t= true\n" +
-		"\ttype\t\t= wpar\n" +
+		"\ttype\t\t= " + w.name + "\n" +
 		"\n" +
-		w.name + "/usr:\n" +
+		mp + "/usr:\n" +
 		"\tdev\t\t= /usr\n" +
 		"\tvfs\t\t= namefs\n" +
-		"\tmount\t\t= true\n" +
-		"\ttype\t\t= wpar\n" +
+		"\ttype\t\t= " + w.name + "\n" +
 		"\toptions\t\t= ro\n" +
 		"\n" +
-		w.name + "/opt:\n" +
+		mp + "/opt:\n" +
 		"\tdev\t\t= /opt\n" +
 		"\tvfs\t\t= namefs\n" +
-		"\tmount\t\t= true\n" +
-		"\ttype\t\t= wpar\n" +
+		"\ttype\t\t= " + w.name + "\n" +
 		"\toptions\t\t= ro\n" +
 		"\n" +
-		w.name + "/proc:\n" +
+		mp + "/proc:\n" +
 		"\tdev\t\t= /proc\n" +
 		"\tvfs\t\t= procfs\n" +
-		"\tmount\t\t= true\n" +
-		"\ttype\t\t= wpar\n" +
+		"\ttype\t\t= " + w.name + "\n" +
 		"\n"
 
-	f, err := os.OpenFile("/etc/filesystems", os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open /etc/filesystems: %w", err)
-	}
-	defer f.Close()
-	_, err = f.WriteString(stanzas)
-	return err
+	return writeFilesystemsAtomic(stanzas)
 }
 
 // removeFilesystemsStanzas removes the stanzas added by writeFilesystemsStanzas.
 // Called on rollback when mkwpar -p fails.
-// We read /etc/filesystems, strip lines belonging to this WPAR, and rewrite.
+// Stanza names are full mount-point paths (/wpars/NAME, /wpars/NAME/usr, …).
 func (w *WPAR) removeFilesystemsStanzas() error {
-	data, err := os.ReadFile("/etc/filesystems")
-	if err != nil {
-		return err
-	}
-	var out []byte
-	skip := false
-	for _, line := range splitLines(string(data)) {
-		if strings.HasPrefix(line, w.name+":") || strings.HasPrefix(line, w.name+"/") {
-			skip = true
-		}
-		if skip && len(line) > 0 && line[0] != '\t' && !strings.HasPrefix(line, w.name) {
-			skip = false
-		}
-		if !skip {
-			out = append(out, []byte(line+"\n")...)
-		}
-	}
-	return os.WriteFile("/etc/filesystems", out, 0644)
+	prefix := "/wpars/" + w.name
+	return rewriteFilesystemsAtomic(func(line string) bool {
+		// A stanza header for this WPAR starts with the full mount-point path
+		// followed by ':'.  Skip the header and all indented attribute lines.
+		return strings.HasPrefix(line, prefix+":")  ||
+			strings.HasPrefix(line, prefix+"/")
+	})
 }
 
 // splitLines splits s into lines without trailing newlines.
@@ -499,6 +484,89 @@ func splitLines(s string) []string {
 	}
 	return lines
 }
+
+const etcFilesystems = "/etc/filesystems"
+const etcFilesystemsLock = "/etc/filesystems.lock"
+
+// writeFilesystemsAtomic appends stanzas to /etc/filesystems under an
+// exclusive lock file, then rewrites atomically via a temp file + rename.
+// This prevents interleaved writes when multiple shim processes start at the
+// same time.
+func writeFilesystemsAtomic(stanzas string) error {
+	return modifyFilesystemsAtomic(func(data []byte) ([]byte, error) {
+		return append(data, []byte(stanzas)...), nil
+	})
+}
+
+// rewriteFilesystemsAtomic removes all stanzas whose header line satisfies
+// isHeader from /etc/filesystems, under a lock.  A stanza consists of its
+// header line and any immediately following tab-indented lines.
+func rewriteFilesystemsAtomic(isHeader func(string) bool) error {
+	return modifyFilesystemsAtomic(func(data []byte) ([]byte, error) {
+		var out []byte
+		skip := false
+		for _, line := range splitLines(string(data)) {
+			if len(line) > 0 && line[0] != '\t' {
+				// Non-indented line: a stanza header (or blank separator).
+				skip = isHeader(line)
+			}
+			if !skip {
+				out = append(out, []byte(line+"\n")...)
+			}
+		}
+		return out, nil
+	})
+}
+
+// modifyFilesystemsAtomic holds a lock on etcFilesystemsLock, reads
+// etcFilesystems, passes its contents to fn, and writes fn's result back
+// via an atomic rename.
+func modifyFilesystemsAtomic(fn func([]byte) ([]byte, error)) error {
+	// Acquire a lock via O_EXCL on a sibling lock file.
+	const maxRetries = 20
+	const retryDelay = 50 * time.Millisecond
+	var lock *os.File
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		lock, err = os.OpenFile(etcFilesystemsLock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("acquire /etc/filesystems lock: %w", err)
+		}
+		time.Sleep(retryDelay)
+	}
+	if err != nil {
+		return fmt.Errorf("acquire /etc/filesystems lock after retries: %w", err)
+	}
+	defer func() {
+		lock.Close()
+		os.Remove(etcFilesystemsLock)
+	}()
+
+	data, err := os.ReadFile(etcFilesystems)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", etcFilesystems, err)
+	}
+
+	newData, err := fn(data)
+	if err != nil {
+		return err
+	}
+
+	tmp := etcFilesystems + ".tmp"
+	if err := os.WriteFile(tmp, newData, 0644); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, etcFilesystems); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s -> %s: %w", tmp, etcFilesystems, err)
+	}
+	return nil
+}
+
+
 
 // createSlow implements the traditional mkwpar path (no pre-built template).
 func (w *WPAR) createSlow(ctx context.Context) error {
@@ -785,8 +853,15 @@ func (w *WPAR) Delete(ctx context.Context) error {
 		log.G(ctx).WithError(err).Warn("wpar: rmwpar -F; WPAR may already be gone")
 	}
 
-	// Remove the base directory created for this WPAR.
-	_ = os.RemoveAll(baseDir)
+	// Only remove the base directory once lswpar confirms the WPAR is gone.
+	// If rmwpar failed the WPAR may still be running with that directory as its
+	// root; removing it while live would corrupt the running partition and, for
+	// hostPath volumes, delete host data.
+	if s, err := lswparState(name); err == nil && s == StateActive {
+		log.G(ctx).Warn("wpar: WPAR still active after rmwpar -F; skipping base directory removal")
+	} else {
+		_ = os.RemoveAll(baseDir)
+	}
 
 	_ = os.Remove(statePath(w.bundlePath))
 	return nil

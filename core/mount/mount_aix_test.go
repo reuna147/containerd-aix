@@ -37,6 +37,11 @@ func TestIsUmountNotMounted(t *testing.T) {
 			want:   true,
 		},
 		{
+			desc:   "AIX 7.3 Could not find anything to unmount",
+			output: "umount: Could not find anything to unmount",
+			want:   true,
+		},
+		{
 			desc:   "EINVAL in output",
 			output: "umount: EINVAL",
 			want:   true,

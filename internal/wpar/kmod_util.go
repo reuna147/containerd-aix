@@ -30,6 +30,13 @@ package wpar
 
 /*
 #include <sys/ioctl.h>
+
+// wpar_kmod_ioctl is a non-variadic wrapper around ioctl(2).
+// cgo cannot call variadic C functions directly; this shim
+// fixes the "unexpected type" error at link time.
+static inline int wpar_kmod_ioctl(int fd, unsigned long req, void *arg) {
+    return ioctl(fd, req, arg);
+}
 */
 import "C"
 
@@ -37,6 +44,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"sync"
 	"unsafe"
 )
 
@@ -154,7 +162,7 @@ func (c *KmodClient) ioctl(req *kmodRequest) error {
 	binary.BigEndian.PutUint32(buf[off:], req.Flags)
 
 	ioctlNum := ioctlNr(kmodMagic, req.Op, uint32(kmodRequestSize))
-	ret := C.ioctl(C.int(c.dev.Fd()), C.ulong(ioctlNum), unsafe.Pointer(&buf[0]))
+	ret := C.wpar_kmod_ioctl(C.int(c.dev.Fd()), C.ulong(ioctlNum), unsafe.Pointer(&buf[0]))
 	if ret != 0 {
 		return fmt.Errorf("kmod ioctl op=%d wpar=%d: ioctl returned %d", req.Op, req.WparID, ret)
 	}

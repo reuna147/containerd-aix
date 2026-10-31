@@ -97,10 +97,13 @@ func unmount(target string, _ int) error {
 }
 
 // isUmountNotMounted returns true when umount(8) reports that the path is not
-// a mount point (AIX error 0506-349 or EINVAL from the underlying syscall).
+// a mount point. AIX 7.3 uses two different messages depending on context:
+//   - "0506-349 <path> is not a mount point." (historical)
+//   - "Could not find anything to unmount" (AIX 7.3 on a non-mounted path)
 func isUmountNotMounted(output string) bool {
 	return strings.Contains(output, "0506-349") ||
 		strings.Contains(output, "not a mount") ||
+		strings.Contains(output, "Could not find anything to unmount") ||
 		strings.Contains(output, "EINVAL")
 }
 

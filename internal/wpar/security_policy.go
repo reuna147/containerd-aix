@@ -219,13 +219,15 @@ func (p *SecurityPolicy) Validate() error {
 	return nil
 }
 
-// Clone returns a deep copy of the policy with a fresh mutex.
-func (p *SecurityPolicy) Clone() SecurityPolicy {
+// Clone returns a pointer to a deep copy of the policy with a fresh mutex.
+// Returning by value would copy the embedded sync.RWMutex (go vet: "return
+// copies lock value"), so we return a pointer.
+func (p *SecurityPolicy) Clone() *SecurityPolicy {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	// Copy only the non-mutex fields to avoid "assignment copies lock value".
-	cp := SecurityPolicy{
+	// Copy only the non-mutex fields; the fresh zero-value RWMutex is correct.
+	cp := &SecurityPolicy{
 		ContainerID:              p.ContainerID,
 		WparID:                   p.WparID,
 		SyscallBitmap:            p.SyscallBitmap,
