@@ -94,6 +94,28 @@ type WPAR struct {
 	exitedAt time.Time
 
 	waiters []chan struct{} // closed when the WPAR transitions to StateDown
+
+	// Security subsystems — populated during the ordered startup sequence.
+	// All fields are set before the container process is released.
+
+	// policy is the unified security policy record for this container.
+	policy *SecurityPolicy
+
+	// wlm manages WLM CPU/memory/process controls.
+	wlm *WLMController
+
+	// kmod manages the per-WPAR syscall bitmap policy.
+	kmod *KmodPolicyManager
+
+	// procMon is the global /proc monitoring daemon (shared across WPARs).
+	procMon *ProcMonitor
+
+	// fsConfig holds the filesystem isolation configuration used during
+	// Setup and Teardown.
+	fsConfig *FSIsolationConfig
+
+	// hostname is the Kubernetes pod hostname assigned to this WPAR.
+	hostname string
 }
 
 // wparName derives a valid AIX WPAR name from a containerd task ID.
@@ -171,6 +193,75 @@ func LoadWPAR(bundlePath string) (*WPAR, error) {
 		w.state = s
 	}
 	return w, nil
+}
+
+// WithSecurityPolicy attaches the unified security policy to the WPAR.
+// Must be called before the ordered startup sequence begins.
+func (w *WPAR) WithSecurityPolicy(p *SecurityPolicy) *WPAR {
+	w.mu.Lock()
+	w.policy = p
+	w.mu.Unlock()
+	return w
+}
+
+// SecurityPolicy returns the container's security policy (may be nil before
+// the startup sequence sets it).
+func (w *WPAR) SecurityPolicy() *SecurityPolicy {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.policy
+}
+
+// WithWLM attaches the WLM resource controller.
+func (w *WPAR) WithWLM(c *WLMController) *WPAR {
+	w.mu.Lock()
+	w.wlm = c
+	w.mu.Unlock()
+	return w
+}
+
+// WithKmod attaches the kmod policy manager.
+func (w *WPAR) WithKmod(k *KmodPolicyManager) *WPAR {
+	w.mu.Lock()
+	w.kmod = k
+	w.mu.Unlock()
+	return w
+}
+
+// WithProcMon attaches the global /proc monitor.
+func (w *WPAR) WithProcMon(m *ProcMonitor) *WPAR {
+	w.mu.Lock()
+	w.procMon = m
+	w.mu.Unlock()
+	return w
+}
+
+// WithFSConfig attaches the filesystem isolation configuration.
+func (w *WPAR) WithFSConfig(cfg *FSIsolationConfig) *WPAR {
+	w.mu.Lock()
+	w.fsConfig = cfg
+	w.mu.Unlock()
+	return w
+}
+
+// WithHostname sets the Kubernetes pod hostname for this WPAR.
+func (w *WPAR) WithHostname(h string) *WPAR {
+	w.mu.Lock()
+	w.hostname = h
+	w.mu.Unlock()
+	return w
+}
+
+// IsOOMKilled returns true when the WLM memory monitor terminated this
+// workload due to its configured memory limit.
+func (w *WPAR) IsOOMKilled() bool {
+	w.mu.Lock()
+	wlm := w.wlm
+	w.mu.Unlock()
+	if wlm == nil {
+		return false
+	}
+	return wlm.IsOOMKilled()
 }
 
 // ID returns the containerd task ID.
