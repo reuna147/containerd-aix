@@ -109,7 +109,7 @@ func ValidateIPCConfig(cfg IPCConfig) error {
 		return fmt.Errorf("hostIPC is not supported: sharing IPC across WPAR boundaries is rejected")
 	}
 	if cfg.ShareIPCWith != "" {
-		return fmt.Errorf("cross-WPAR IPC sharing with WPAR %q requires a separately designed " +
+		return fmt.Errorf("cross-WPAR IPC sharing with WPAR %q requires a separately designed "+
 			"and explicitly authorized mechanism; rejecting configuration", cfg.ShareIPCWith)
 	}
 	return nil

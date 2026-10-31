@@ -115,8 +115,8 @@ type procEntry struct {
 
 // WparMonitorConfig holds the per-WPAR monitoring configuration.
 type WparMonitorConfig struct {
-	WparID   uint32
-	Rules    []DRRule
+	WparID uint32
+	Rules  []DRRule
 	// MonitorGapPolicy is the response applied when a monitoring gap is detected.
 	MonitorGapPolicy DRAction
 }

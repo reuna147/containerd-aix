@@ -104,10 +104,13 @@ func (r *PortRegistry) Release(containerID string) {
 
 // ValidateNetworkPolicy checks the network configuration for unsupported or
 // rejected settings.
+//
+// WPARs always share the host network; hostNetwork=false (pod isolation) is
+// rejected until a CNI plugin is available.
 func ValidateNetworkPolicy(policy NetworkPolicy, containerID string) error {
-	if policy.HostNetworking {
-		return fmt.Errorf("container %s: host networking cannot be claimed while WPAR " +
-			"isolation is in use; per-pod network isolation is not asserted", containerID)
+	if !policy.HostNetworking {
+		return fmt.Errorf("container %s: pod network isolation (hostNetwork=false) "+
+			"is not supported; all WPARs share the host network", containerID)
 	}
 	// We do not support dedicated pod IP addresses or Kubernetes NetworkPolicy
 	// enforcement in this release.

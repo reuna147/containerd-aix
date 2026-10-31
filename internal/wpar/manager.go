@@ -138,13 +138,25 @@ func (m *Manager) Start(ctx context.Context, params *bootapi.BootstrapParams) (*
 	)
 	cmd.Dir = "/" // Never use the bundle dir (issue 16)
 	cmd.Stdout = nil
-	cmd.Stderr = os.Stderr
+	// Do NOT inherit the start process's stderr. containerd reads everything the
+	// "start" binary prints on stdout+stderr as the bootstrap result
+	// (core/runtime/v2/binary.go CombinedOutput), so any shim server output
+	// before it detaches would corrupt the address string containerd tries to
+	// dial. Redirect to a log file instead.
+	shimLogPath := socketDir + "/" + id + "-shim.log"
+	shimLog, err := os.OpenFile(shimLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		// Fall back to /dev/null rather than inheriting start-process stderr.
+		shimLog, _ = os.Open(os.DevNull)
+	}
+	cmd.Stderr = shimLog
 	cmd.ExtraFiles = []*os.File{socketFile}
 	// Start a new session so the server survives the start process exiting.
 	setSysProcAttr(cmd)
 
 	if err := cmd.Start(); err != nil {
 		socketFile.Close()
+		shimLog.Close()
 		socket.Close()
 		_ = shim.RemoveSocket(address)
 		return nil, fmt.Errorf("spawn shim server: %w", err)
@@ -152,6 +164,7 @@ func (m *Manager) Start(ctx context.Context, params *bootapi.BootstrapParams) (*
 
 	// Close our copies — the child has its own inherited fds.
 	socketFile.Close()
+	shimLog.Close()
 	socket.Close()
 
 	// Detach the child wait; we do not track the server PID in the manager.

@@ -313,12 +313,24 @@ func TestAdmissionRejectsShareProcessNamespace(t *testing.T) {
 	}
 }
 
-// TestAdmissionRejectsHostNetworking ensures host networking is rejected.
+// TestAdmissionRejectsHostNetworking ensures pod network isolation is rejected.
+// WPARs always share the host network; hostNetwork=false (pod isolation) is
+// the configuration that must be refused.
 func TestAdmissionRejectsHostNetworking(t *testing.T) {
-	p := &SecurityPolicy{Network: NetworkPolicy{HostNetworking: true}}
+	// hostNetwork=false means the workload wants pod-network isolation, which
+	// WPARs cannot provide. This must be rejected.
+	p := &SecurityPolicy{Network: NetworkPolicy{HostNetworking: false}}
 	req := AdmissionRequest{ContainerID: "test", Policy: p}
 	if err := Admit(req); err == nil {
-		t.Error("expected admission to reject hostNetworking=true")
+		t.Error("expected admission to reject hostNetworking=false (pod isolation not supported)")
+	}
+
+	// hostNetwork=true means the workload accepts host networking, which is
+	// the only mode WPARs offer. This must be accepted (other fields permitting).
+	p2 := &SecurityPolicy{Network: NetworkPolicy{HostNetworking: true}, UID: 1000}
+	req2 := AdmissionRequest{ContainerID: "test", Policy: p2}
+	if err := Admit(req2); err != nil {
+		t.Errorf("expected admission to accept hostNetworking=true: %v", err)
 	}
 }
 
@@ -382,7 +394,12 @@ func TestAdmissionAcceptsValidPolicy(t *testing.T) {
 		UID:          1000,
 		GID:          1000,
 		RunAsNonRoot: true,
+		// HostNetworking=true: WPARs always use host networking.
+		Network:               NetworkPolicy{HostNetworking: true},
 		RequestedCapabilities: []string{"CAP_NET_BIND_SERVICE"},
+		// AllowedHostPaths must include the bind source so SetupFSIsolation
+		// agrees with admission on what is permitted.
+		AllowedHostPaths: []string{"/data"},
 		Mounts: []MountSpec{{
 			Source:      "/data",
 			Destination: "/mnt/data",

@@ -43,8 +43,13 @@ import (
 	"syscall"
 	"time"
 
+	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/shim"
 )
 
 // State represents the lifecycle state of a WPAR as reported by lswpar.
@@ -117,6 +122,11 @@ type WPAR struct {
 
 	// hostname is the Kubernetes pod hostname assigned to this WPAR.
 	hostname string
+
+	// stdoutFIFO and stderrFIFO are the containerd FIFO paths stored at
+	// Create time (from CreateTaskRequest.Stdout/Stderr) and consumed at Start.
+	stdoutFIFO string
+	stderrFIFO string
 }
 
 // wparName derives a valid AIX WPAR name from a containerd task ID.
@@ -356,23 +366,21 @@ func (w *WPAR) Create(ctx context.Context) error {
 //
 // Steps (from the validation notes performance section):
 //  1. Copy the template directory tree into /wpars/NAME (~1 s for 3,250 files).
-//  2. Run "mkwpar -n NAME -p NAME" — attaches the existing /etc/filesystems
-//     stanzas from the template copy; skips populate entirely (~1 s).
-//  3. The image rootfs is still copied in by the caller via pax.
+//  2. Write four /etc/filesystems stanzas for the new WPAR's name. mkwpar -p
+//     attaches existing stanzas keyed by WPAR name — if they don't exist,
+//     mkwpar -p fails or builds the wrong thing.
+//  3. Run "mkwpar -n NAME -p NAME" (~1 s). Skips populate entirely.
 //
-// Teardown: rmwpar -F takes ~0.6 s (no LVs to remove).  The directory is left
-// behind by rmwpar and must be removed separately (done in Delete).
+// Teardown: rmwpar -F takes ~0.6 s (no LVs to remove). The directory is left
+// behind by rmwpar and removed by Delete.
 func (w *WPAR) createFast(ctx context.Context) error {
-	// The WPAR base directory lives in /wpars/NAME.  mkwpar -p does NOT create
-	// it — we must copy the template first.
 	baseDir := "/wpars/" + w.name
 
-	// Ensure /wpars exists and has mode 0700 (required by mkwpar).
 	if err := os.MkdirAll("/wpars", 0700); err != nil {
 		return fmt.Errorf("create /wpars: %w", err)
 	}
 
-	// Copy the template.  pax -rw -pe requires the destination to exist.
+	// pax -rw -pe requires the destination to exist.
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return fmt.Errorf("create wpar base dir %s: %w", baseDir, err)
 	}
@@ -385,14 +393,111 @@ func (w *WPAR) createFast(ctx context.Context) error {
 		return fmt.Errorf("copy image rootfs into wpar: %w", err)
 	}
 
-	// mkwpar -n NAME -p NAME: attach existing /etc/filesystems stanzas.
-	// -p takes the WPAR name whose stanzas already exist in /etc/filesystems
-	// (populated when we copied the template).
+	// Write /etc/filesystems stanzas for this WPAR before mkwpar -p.
+	// mkwpar -p looks up stanzas by WPAR name; copying the directory does not
+	// create them — they must be appended to /etc/filesystems explicitly.
+	if err := w.writeFilesystemsStanzas(baseDir); err != nil {
+		return fmt.Errorf("write /etc/filesystems stanzas: %w", err)
+	}
+
+	// mkwpar -n NAME -p NAME: attach the stanzas we just wrote.
 	if err := runCmdAt(ctx, "/", "mkwpar", "-n", w.name, "-p", w.name); err != nil {
+		_ = w.removeFilesystemsStanzas()
 		return fmt.Errorf("mkwpar -p: %w", err)
 	}
 
 	return w.saveState()
+}
+
+// writeFilesystemsStanzas appends the four required /etc/filesystems stanzas
+// for the new WPAR to the host's /etc/filesystems file.
+//
+// The stanzas mirror the standard WPAR layout:
+//   - /           as namefs (rw) over baseDir
+//   - /usr        as namefs (ro) from the host
+//   - /opt        as namefs (ro) from the host
+//   - /proc       as procfs
+//
+// mkwpar -p skips all file system creation and the costly populate step; it
+// only calls into the kernel to register the WPAR against the stanzas it
+// finds in /etc/filesystems. Without this step, -p either fails or attaches
+// the template's stanzas (which point to the wrong directory).
+func (w *WPAR) writeFilesystemsStanzas(baseDir string) error {
+	stanzas := "\n" +
+		w.name + ":\n" +
+		"\tdev\t\t= " + baseDir + "\n" +
+		"\tvfs\t\t= namefs\n" +
+		"\tmount\t\t= true\n" +
+		"\ttype\t\t= wpar\n" +
+		"\n" +
+		w.name + "/usr:\n" +
+		"\tdev\t\t= /usr\n" +
+		"\tvfs\t\t= namefs\n" +
+		"\tmount\t\t= true\n" +
+		"\ttype\t\t= wpar\n" +
+		"\toptions\t\t= ro\n" +
+		"\n" +
+		w.name + "/opt:\n" +
+		"\tdev\t\t= /opt\n" +
+		"\tvfs\t\t= namefs\n" +
+		"\tmount\t\t= true\n" +
+		"\ttype\t\t= wpar\n" +
+		"\toptions\t\t= ro\n" +
+		"\n" +
+		w.name + "/proc:\n" +
+		"\tdev\t\t= /proc\n" +
+		"\tvfs\t\t= procfs\n" +
+		"\tmount\t\t= true\n" +
+		"\ttype\t\t= wpar\n" +
+		"\n"
+
+	f, err := os.OpenFile("/etc/filesystems", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open /etc/filesystems: %w", err)
+	}
+	defer f.Close()
+	_, err = f.WriteString(stanzas)
+	return err
+}
+
+// removeFilesystemsStanzas removes the stanzas added by writeFilesystemsStanzas.
+// Called on rollback when mkwpar -p fails.
+// We read /etc/filesystems, strip lines belonging to this WPAR, and rewrite.
+func (w *WPAR) removeFilesystemsStanzas() error {
+	data, err := os.ReadFile("/etc/filesystems")
+	if err != nil {
+		return err
+	}
+	var out []byte
+	skip := false
+	for _, line := range splitLines(string(data)) {
+		if strings.HasPrefix(line, w.name+":") || strings.HasPrefix(line, w.name+"/") {
+			skip = true
+		}
+		if skip && len(line) > 0 && line[0] != '\t' && !strings.HasPrefix(line, w.name) {
+			skip = false
+		}
+		if !skip {
+			out = append(out, []byte(line+"\n")...)
+		}
+	}
+	return os.WriteFile("/etc/filesystems", out, 0644)
+}
+
+// splitLines splits s into lines without trailing newlines.
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i, c := range s {
+		if c == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
 }
 
 // createSlow implements the traditional mkwpar path (no pre-built template).
@@ -403,8 +508,9 @@ func (w *WPAR) createSlow(ctx context.Context) error {
 		return fmt.Errorf("create /wpars: %w", err)
 	}
 
-	// -M flags must be separate arguments (not a single "directory=/ vfs=directory" word).
-	args := []string{"-n", w.name, "-d", baseDir, "-M", "directory=/", "-M", "vfs=directory"}
+	// One -M flag with two separate attribute words: directory=/ vfs=directory.
+	// (Two separate -M flags each with one attribute is also rejected by mkwpar.)
+	args := []string{"-n", w.name, "-d", baseDir, "-M", "directory=/", "vfs=directory"}
 	if err := runCmdAt(ctx, "/", "mkwpar", args...); err != nil {
 		return fmt.Errorf("mkwpar: %w", err)
 	}
@@ -432,7 +538,7 @@ func copyRootfs(ctx context.Context, src, dst string) error {
 
 // Start activates the WPAR via startwpar, then launches the container process
 // via clogin(1) inside the running WPAR.
-func (w *WPAR) Start(ctx context.Context, specArgs []string, specEnv []string, specCwd string, stdoutFIFO, stderrFIFO string) error {
+func (w *WPAR) Start(ctx context.Context, specArgs []string, specEnv []string, specCwd string, stdoutFIFO, stderrFIFO string, publisher shim.Publisher, pubCtx context.Context) error {
 	if err := runCmdAt(ctx, "/", "startwpar", w.name); err != nil {
 		return fmt.Errorf("startwpar: %w", err)
 	}
@@ -445,10 +551,10 @@ func (w *WPAR) Start(ctx context.Context, specArgs []string, specEnv []string, s
 		return err
 	}
 
-	// Run the container process inside the WPAR with clogin -R.
+	// Run the container process inside the WPAR via clogin(1).
 	// clogin joins its arguments into a single shell command, so every
 	// argument must be shell-quoted.
-	pid, err := w.runProcess(ctx, specArgs, specEnv, specCwd, stdoutFIFO, stderrFIFO)
+	pid, err := w.runProcess(ctx, specArgs, specEnv, specCwd, stdoutFIFO, stderrFIFO, publisher, pubCtx)
 	if err != nil {
 		return fmt.Errorf("run container process: %w", err)
 	}
@@ -476,7 +582,7 @@ func (w *WPAR) Start(ctx context.Context, specArgs []string, specEnv []string, s
 //     /dev/null.
 //   - We wire stdout and stderr to containerd's FIFOs.
 //   - clogin passes the exit code through; for signal death we report 128+sig.
-func (w *WPAR) runProcess(_ context.Context, args []string, env []string, cwd string, stdoutFIFO, stderrFIFO string) (uint32, error) {
+func (w *WPAR) runProcess(_ context.Context, args []string, env []string, cwd string, stdoutFIFO, stderrFIFO string, publisher shim.Publisher, pubCtx context.Context) (uint32, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("runProcess: no command specified")
 	}
@@ -530,15 +636,16 @@ func (w *WPAR) runProcess(_ context.Context, args []string, env []string, cwd st
 
 	pid := uint32(cmd.Process.Pid)
 
-	// Wait for clogin in the background; close the WPAR waiters when done.
-	go w.waitForProcess(cmd)
+	// Wait for clogin in the background; close the WPAR waiters when done
+	// and publish the TaskExit event so ctr/CRI learns the container exited.
+	go w.waitForProcess(cmd, publisher, pubCtx)
 
 	return pid, nil
 }
 
 // waitForProcess waits for the clogin process to exit, records the exit code,
-// and notifies all waiters.
-func (w *WPAR) waitForProcess(cmd *exec.Cmd) {
+// notifies all waiters, and publishes the TaskExit event.
+func (w *WPAR) waitForProcess(cmd *exec.Cmd, publisher shim.Publisher, pubCtx context.Context) {
 	err := cmd.Wait()
 
 	var exitCode uint32
@@ -555,17 +662,47 @@ func (w *WPAR) waitForProcess(cmd *exec.Cmd) {
 		}
 	}
 
+	now := time.Now()
 	w.mu.Lock()
 	w.state = StateDown
 	w.exitCode = exitCode
 	if w.exitedAt.IsZero() {
-		w.exitedAt = time.Now()
+		w.exitedAt = now
 	}
+	exitedAt := w.exitedAt
+	pid := w.pid
+	id := w.id
 	waiters := w.waiters
 	w.waiters = nil
 	w.mu.Unlock()
 
 	_ = w.saveState()
+
+	// Publish the TaskExit event. Without this, ctr run never returns and
+	// CRI never learns that the container exited.
+	if publisher != nil {
+		_ = publisher.Publish(pubCtx, runtime.TaskExitEventTopic, &eventstypes.TaskExit{
+			ContainerID: id,
+			ID:          id,
+			Pid:         pid,
+			ExitStatus:  exitCode,
+			ExitedAt:    timestamppb.New(exitedAt),
+		})
+	}
+
+	for _, ch := range waiters {
+		close(ch)
+	}
+}
+
+// releaseWaiters unblocks any goroutines blocked in Wait(). It is called
+// during Delete for tasks that were never started (state never reached
+// StateActive, so waitForProcess never ran).
+func (w *WPAR) releaseWaiters() {
+	w.mu.Lock()
+	waiters := w.waiters
+	w.waiters = nil
+	w.mu.Unlock()
 	for _, ch := range waiters {
 		close(ch)
 	}
@@ -635,7 +772,7 @@ func (w *WPAR) Stop(ctx context.Context) error {
 func (w *WPAR) Delete(ctx context.Context) error {
 	w.mu.Lock()
 	name := w.name
-	baseDir := w.rootdir + "-wpar"
+	baseDir := "/wpars/" + w.name
 	w.mu.Unlock()
 
 	// rmwpar -F does its own stop — do NOT stopwpar first (double stop breaks
@@ -659,7 +796,11 @@ func (w *WPAR) Delete(ctx context.Context) error {
 func (w *WPAR) Wait() <-chan struct{} {
 	ch := make(chan struct{})
 	w.mu.Lock()
-	if w.state == StateDown {
+	// Block until exitedAt is set, not just StateDown.
+	// A newly created task is StateDown but has no exit yet; closing the channel
+	// immediately would cause ctr/CRI to see an instant "exited 0" before the
+	// container has run. waitForProcess sets exitedAt before closing waiters.
+	if !w.exitedAt.IsZero() {
 		close(ch)
 	} else {
 		w.waiters = append(w.waiters, ch)

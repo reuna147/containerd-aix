@@ -60,22 +60,22 @@ type ComponentHealth struct {
 
 // RuntimeHealth aggregates the health of all mandatory security components.
 type RuntimeHealth struct {
-	KmodExtension  ComponentHealth `json:"kmod_extension"`
-	ProcMonitor    ComponentHealth `json:"proc_monitor"`
-	WLMSubsystem   ComponentHealth `json:"wlm_subsystem"`
+	KmodExtension ComponentHealth `json:"kmod_extension"`
+	ProcMonitor   ComponentHealth `json:"proc_monitor"`
+	WLMSubsystem  ComponentHealth `json:"wlm_subsystem"`
 }
 
 // WPAREnforcementStatus reports the per-container enforcement state.
 type WPAREnforcementStatus struct {
-	ContainerID    string          `json:"container_id"`
-	WparName       string          `json:"wpar_name"`
-	WparID         uint32          `json:"wpar_id"`
-	State          string          `json:"state"` // "running", "stopped", "error"
-	SyscallPolicy  bool            `json:"syscall_policy_active"`
-	ProcMonitor    bool            `json:"proc_monitor_active"`
-	WLMActive      bool            `json:"wlm_active"`
-	OOMKilled      bool            `json:"oom_killed,omitempty"`
-	PolicyPath     string          `json:"policy_path,omitempty"`
+	ContainerID   string `json:"container_id"`
+	WparName      string `json:"wpar_name"`
+	WparID        uint32 `json:"wpar_id"`
+	State         string `json:"state"` // "running", "stopped", "error"
+	SyscallPolicy bool   `json:"syscall_policy_active"`
+	ProcMonitor   bool   `json:"proc_monitor_active"`
+	WLMActive     bool   `json:"wlm_active"`
+	OOMKilled     bool   `json:"oom_killed,omitempty"`
+	PolicyPath    string `json:"policy_path,omitempty"`
 }
 
 // ContainerRecord is the persistent mapping for a single managed container.

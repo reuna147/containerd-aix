@@ -143,9 +143,9 @@ func NewWLMController(
 // Apply creates the WLM class and configures all resource limits. Must be
 // called after the WPAR is created and before the container process starts.
 func (c *WLMController) Apply(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	// Do NOT hold c.mu here: both createClass and configureClass acquire
+	// c.mu internally (configureClass to read the policy). A sync.Mutex is
+	// not reentrant; holding it here and calling those methods deadlocks.
 	if err := c.createClass(ctx); err != nil {
 		return fmt.Errorf("wlm: create class %s: %w", c.className, err)
 	}

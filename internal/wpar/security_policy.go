@@ -63,10 +63,10 @@ type SecurityPolicy struct {
 	SyscallBitmap SyscallBitmap `json:"syscall_bitmap"`
 
 	// --- Identity and privilege ----------------------------------------------
-	UID                     uint32   `json:"uid"`
-	GID                     uint32   `json:"gid"`
+	UID                      uint32   `json:"uid"`
+	GID                      uint32   `json:"gid"`
 	SupplementalGroups       []uint32 `json:"supplemental_groups,omitempty"`
-	RunAsNonRoot            bool     `json:"run_as_non_root"`
+	RunAsNonRoot             bool     `json:"run_as_non_root"`
 	AllowPrivilegeEscalation bool     `json:"allow_privilege_escalation"`
 	// RequestedCapabilities lists the Linux capability names requested by the
 	// workload (before translation to AIX privileges).
@@ -75,10 +75,10 @@ type SecurityPolicy struct {
 	AIXPrivileges []string `json:"aix_privileges,omitempty"`
 
 	// --- Filesystem configuration -------------------------------------------
-	ReadOnlyRootFS        bool             `json:"read_only_root_fs"`
-	Mounts                []MountSpec      `json:"mounts,omitempty"`
-	AllowedHostPaths      []string         `json:"allowed_host_paths,omitempty"`
-	MountPropagationCheck bool             `json:"mount_propagation_check"`
+	ReadOnlyRootFS        bool        `json:"read_only_root_fs"`
+	Mounts                []MountSpec `json:"mounts,omitempty"`
+	AllowedHostPaths      []string    `json:"allowed_host_paths,omitempty"`
+	MountPropagationCheck bool        `json:"mount_propagation_check"`
 
 	// --- Resource controls ---------------------------------------------------
 	Resources ResourcePolicy `json:"resources"`
@@ -91,9 +91,9 @@ type SecurityPolicy struct {
 
 	// --- Rejection flags -----------------------------------------------------
 	// These are set when the workload requested a feature that must be rejected.
-	RejectHostPID              bool `json:"reject_host_pid,omitempty"`
-	RejectHostIPC              bool `json:"reject_host_ipc,omitempty"`
-	RejectHostUsers            bool `json:"reject_host_users,omitempty"`
+	RejectHostPID               bool `json:"reject_host_pid,omitempty"`
+	RejectHostIPC               bool `json:"reject_host_ipc,omitempty"`
+	RejectHostUsers             bool `json:"reject_host_users,omitempty"`
 	RejectShareProcessNamespace bool `json:"reject_share_process_namespace,omitempty"`
 }
 
@@ -101,7 +101,7 @@ type SecurityPolicy struct {
 type MountSpec struct {
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
-	Type        string `json:"type"`   // e.g. "namefs", "tmpfs", "bind"
+	Type        string `json:"type"` // e.g. "namefs", "tmpfs", "bind"
 	ReadOnly    bool   `json:"read_only"`
 	NoSUID      bool   `json:"no_suid"`
 	NoDev       bool   `json:"no_dev"`
@@ -112,11 +112,11 @@ type MountSpec struct {
 // ResourcePolicy holds WLM-level resource constraints.
 type ResourcePolicy struct {
 	// CPU
-	CPUShares uint64 `json:"cpu_shares,omitempty"`
+	CPUShares   uint64  `json:"cpu_shares,omitempty"`
 	CPULimitPct float64 `json:"cpu_limit_pct,omitempty"` // 0–100, translated from K8s limits
 
 	// Memory
-	MemoryLimitBytes int64 `json:"memory_limit_bytes,omitempty"`
+	MemoryLimitBytes   int64 `json:"memory_limit_bytes,omitempty"`
 	MemoryRequestBytes int64 `json:"memory_request_bytes,omitempty"`
 
 	// Process / thread
@@ -138,7 +138,11 @@ type NetworkPolicy struct {
 	AllowRawSockets bool `json:"allow_raw_sockets,omitempty"`
 	// AllowPrivilegedPorts permits binding ports < 1024.
 	AllowPrivilegedPorts bool `json:"allow_privileged_ports,omitempty"`
-	// HostNetworking is always false; claimed host-networking is rejected.
+	// HostNetworking indicates whether the workload accepts host networking
+	// (true) or requests pod-network isolation (false). All WPARs share the
+	// host network; only hostNetwork=true is supported. Setting this false
+	// (i.e., requesting pod isolation) is rejected until a network plugin
+	// is available.
 	HostNetworking bool `json:"host_networking,omitempty"`
 }
 
@@ -195,8 +199,11 @@ func (p *SecurityPolicy) Validate() error {
 	if p.RejectShareProcessNamespace {
 		return fmt.Errorf("shareProcessNamespace requires sharing across WPAR boundaries: not supported")
 	}
-	if p.Network.HostNetworking {
-		return fmt.Errorf("host networking cannot be claimed while WPAR isolation is in use")
+	// WPARs always use host networking. Reject requests for pod-network isolation
+	// (hostNetwork: false) until a network plugin provides per-pod addresses.
+	if !p.Network.HostNetworking {
+		return fmt.Errorf("pod network isolation (hostNetwork=false) is not supported; " +
+			"all WPARs share the host network — set hostNetwork=true")
 	}
 	for _, m := range p.Mounts {
 		switch m.Propagation {
@@ -212,13 +219,33 @@ func (p *SecurityPolicy) Validate() error {
 	return nil
 }
 
-// Clone returns a deep copy of the policy (without the mutex).
+// Clone returns a deep copy of the policy with a fresh mutex.
 func (p *SecurityPolicy) Clone() SecurityPolicy {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	cp := *p
-	cp.mu = sync.RWMutex{}
+	// Copy only the non-mutex fields to avoid "assignment copies lock value".
+	cp := SecurityPolicy{
+		ContainerID:              p.ContainerID,
+		WparID:                   p.WparID,
+		SyscallBitmap:            p.SyscallBitmap,
+		UID:                      p.UID,
+		GID:                      p.GID,
+		RunAsNonRoot:             p.RunAsNonRoot,
+		AllowPrivilegeEscalation: p.AllowPrivilegeEscalation,
+		ReadOnlyRootFS:           p.ReadOnlyRootFS,
+		MountPropagationCheck:    p.MountPropagationCheck,
+		Resources:                p.Resources,
+		Network: NetworkPolicy{
+			AllowRawSockets:      p.Network.AllowRawSockets,
+			AllowPrivilegedPorts: p.Network.AllowPrivilegedPorts,
+			HostNetworking:       p.Network.HostNetworking,
+		},
+		RejectHostPID:               p.RejectHostPID,
+		RejectHostIPC:               p.RejectHostIPC,
+		RejectHostUsers:             p.RejectHostUsers,
+		RejectShareProcessNamespace: p.RejectShareProcessNamespace,
+	}
 	cp.SupplementalGroups = append([]uint32(nil), p.SupplementalGroups...)
 	cp.RequestedCapabilities = append([]string(nil), p.RequestedCapabilities...)
 	cp.AIXPrivileges = append([]string(nil), p.AIXPrivileges...)

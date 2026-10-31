@@ -304,6 +304,7 @@ func TeardownControls(ctx context.Context, sc StartupContext, bundlePath string)
 	_ = CleanupIPCResources(sc.WparName)
 
 	// 6. Unmount and remove filesystem resources.
-	wparBaseDir := bundlePath + "-wpar"
+	// The WPAR base directory is /wpars/<wparName>, not bundlePath+"-wpar".
+	wparBaseDir := "/wpars/" + sc.WparName
 	_ = TeardownFSIsolation(wparBaseDir)
 }

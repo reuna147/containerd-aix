@@ -79,20 +79,20 @@ import (
 // rather than silently approximated with a broader privilege.
 var linuxCapToAIXPriv = map[string][]string{
 	// Filesystem capabilities
-	"chown":            {"PV_DAC_X", "PV_DAC_W", "PV_DAC_R"},
-	"dac_override":     {"PV_DAC_X", "PV_DAC_W", "PV_DAC_R"},
-	"dac_read_search":  {"PV_DAC_R"},
-	"fowner":           {"PV_DAC_X", "PV_DAC_W"},
-	"fsetid":           {"PV_PROC_SETUID"},
-	"setuid":           {"PV_PROC_SETUID"},
-	"setgid":           {"PV_PROC_SETGID"},
-	"setpcap":          {"PV_PROC_SETPCAP"},
+	"chown":           {"PV_DAC_X", "PV_DAC_W", "PV_DAC_R"},
+	"dac_override":    {"PV_DAC_X", "PV_DAC_W", "PV_DAC_R"},
+	"dac_read_search": {"PV_DAC_R"},
+	"fowner":          {"PV_DAC_X", "PV_DAC_W"},
+	"fsetid":          {"PV_PROC_SETUID"},
+	"setuid":          {"PV_PROC_SETUID"},
+	"setgid":          {"PV_PROC_SETGID"},
+	"setpcap":         {"PV_PROC_SETPCAP"},
 
 	// Process capabilities
-	"kill":             {"PV_PROC_KILL"},
-	"sys_nice":         {"PV_PROC_NICE"},
-	"sys_ptrace":       {"PV_PROC_PTRACE"},
-	"sys_resource":     {"PV_PROC_RLIMIT"},
+	"kill":         {"PV_PROC_KILL"},
+	"sys_nice":     {"PV_PROC_NICE"},
+	"sys_ptrace":   {"PV_PROC_PTRACE"},
+	"sys_resource": {"PV_PROC_RLIMIT"},
 
 	// Networking capabilities
 	"net_bind_service": {"PV_NET_PORT"},
@@ -101,14 +101,14 @@ var linuxCapToAIXPriv = map[string][]string{
 	"net_broadcast":    {"PV_NET_BCAST"},
 
 	// IPC / shared memory
-	"ipc_lock":         {"PV_MLOCK"},
-	"ipc_owner":        {"PV_IPC_OWNER"},
+	"ipc_lock":  {"PV_MLOCK"},
+	"ipc_owner": {"PV_IPC_OWNER"},
 
 	// Device / audit
-	"mknod":            {"PV_DEV_CDEV"},
-	"sys_admin":        {"PV_PROC_OWNER"},  // partial — sys_admin is intentionally narrow
-	"audit_write":      {"PV_AUDIT_WRITE"},
-	"audit_control":    {"PV_AUDIT_CONTROL"},
+	"mknod":         {"PV_DEV_CDEV"},
+	"sys_admin":     {"PV_PROC_OWNER"}, // partial — sys_admin is intentionally narrow
+	"audit_write":   {"PV_AUDIT_WRITE"},
+	"audit_control": {"PV_AUDIT_CONTROL"},
 }
 
 // UnsupportedCapabilities lists Linux capabilities that have no acceptable
@@ -164,10 +164,10 @@ func TranslateCapabilities(caps []string) ([]string, error) {
 // CredentialConfig holds the identity and privilege configuration for a
 // container's startup helper.
 type CredentialConfig struct {
-	UID                     uint32
-	GID                     uint32
+	UID                      uint32
+	GID                      uint32
 	SupplementalGroups       []uint32
-	RunAsNonRoot            bool
+	RunAsNonRoot             bool
 	AllowPrivilegeEscalation bool
 	// AIXPrivileges is the translated set of AIX privilege names to grant.
 	AIXPrivileges []string
@@ -228,7 +228,8 @@ func BuildStartArgs(cfg CredentialConfig, containerArgs []string) []string {
 // helper runs.
 //
 // On AIX, wpar privilege ceilings are set using:
-//   mkwpar/chwpar -S priv=NAME1,NAME2,...
+//
+//	mkwpar/chwpar -S priv=NAME1,NAME2,...
 //
 // The ceiling prevents any process inside the WPAR from acquiring privileges
 // beyond those listed, regardless of setuid executables or setppriv calls.
@@ -248,9 +249,9 @@ func chwparPrivileges(wparName string, privs []string) error {
 		privVal = strings.Join(privs, ",")
 	}
 
-	// chwpar -S priv=<list> <name>
+	// chwpar -S privs=<list> <name>
 	// When privVal is empty, this removes all privileges from the ceiling.
-	arg := "priv=" + privVal
+	arg := "privs=" + privVal
 	cmd := exec.Command("chwpar", "-S", arg, wparName)
 	cmd.Dir = "/"
 	out, err := cmd.CombinedOutput()
