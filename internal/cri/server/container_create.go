@@ -620,7 +620,7 @@ func (c *criService) buildContainerSpec(
 		// Platform helpers
 		isLinux   = platform.OS == "linux"
 		isWindows = platform.OS == "windows"
-		isDarwin  = platform.OS == "darwin"
+		isDarwin  = platform.OS == "darwin" || platform.OS == "aix"
 	)
 
 	switch {

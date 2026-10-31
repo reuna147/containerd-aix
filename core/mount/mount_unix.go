@@ -1,4 +1,4 @@
-//go:build !windows && !openbsd
+//go:build !windows && !openbsd && !aix
 
 /*
    Copyright The containerd Authors.

@@ -19,6 +19,8 @@
 package podsandbox
 
 import (
+	"fmt"
+
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	"github.com/containerd/containerd/v2/pkg/oci"
@@ -27,14 +29,35 @@ import (
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
-func (c *Controller) sandboxContainerSpec(id string, config *runtime.PodSandboxConfig, _ *imagespec.ImageConfig, _ string, _ []string) (_ *runtimespec.Spec, _ error) {
-	return c.runtimeSpec(id, annotations.DefaultCRIAnnotations(id, "", c.getSandboxImageName(), config, true)...)
+func (c *Controller) sandboxContainerSpec(id string, config *runtime.PodSandboxConfig, imageConfig *imagespec.ImageConfig, _ string, _ []string) (_ *runtimespec.Spec, _ error) {
+	// The pause/sandbox image must have an entrypoint or cmd.
+	if len(imageConfig.Entrypoint) == 0 && len(imageConfig.Cmd) == 0 {
+		return nil, fmt.Errorf("invalid empty entrypoint and cmd in sandbox image config %+v", imageConfig)
+	}
+
+	specOpts := annotations.DefaultCRIAnnotations(id, "", c.getSandboxImageName(), config, true)
+
+	// Apply environment variables from the image.
+	if len(imageConfig.Env) > 0 {
+		specOpts = append(specOpts, oci.WithEnv(imageConfig.Env))
+	}
+
+	// Apply working directory from the image.
+	if imageConfig.WorkingDir != "" {
+		specOpts = append(specOpts, oci.WithProcessCwd(imageConfig.WorkingDir))
+	}
+
+	specOpts = append(specOpts, oci.WithProcessArgs(append(imageConfig.Entrypoint, imageConfig.Cmd...)...))
+
+	return c.runtimeSpec(id, specOpts...)
 }
 
 // sandboxContainerSpecOpts generates OCI spec options for
-// the sandbox container.
+// the sandbox container. On non-Linux/non-Windows platforms the process
+// args, env, and cwd are applied directly in sandboxContainerSpec; this
+// function returns no additional options.
 func (c *Controller) sandboxContainerSpecOpts(config *runtime.PodSandboxConfig, imageConfig *imagespec.ImageConfig) ([]oci.SpecOpts, error) {
-	return []oci.SpecOpts{}, nil
+	return nil, nil
 }
 
 // setupSandboxFiles sets up necessary sandbox files including /dev/shm, /etc/hosts,
