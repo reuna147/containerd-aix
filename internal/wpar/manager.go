@@ -136,7 +136,7 @@ func (m *Manager) Start(ctx context.Context, params *bootapi.BootstrapParams) (*
 		"-id", id,
 		"-address", params.GetContainerdGrpcAddress(),
 	)
-	cmd.Dir = "/"      // Never use the bundle dir (issue 16)
+	cmd.Dir = "/" // Never use the bundle dir (issue 16)
 	cmd.Stdout = nil
 	cmd.Stderr = os.Stderr
 	cmd.ExtraFiles = []*os.File{socketFile}

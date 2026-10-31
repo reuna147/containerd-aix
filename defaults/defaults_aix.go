@@ -34,6 +34,6 @@ const (
 	// DefaultDiffer is the default differ for AIX.
 	DefaultDiffer = "walking"
 	// DefaultRuntime is the default AIX runtime for running containers.
-	// Placeholder for a future AIX WPAR-based runtime.
+	// Uses the WPAR-based shim (containerd-shim-wpar-v1).
 	DefaultRuntime = "io.containerd.wpar.v1"
 )

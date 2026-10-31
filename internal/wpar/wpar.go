@@ -21,13 +21,13 @@
 // Linux containers. This package provides the low-level lifecycle operations by
 // shelling out to the standard AIX WPAR management tools:
 //
-//   mkwpar  – create a new WPAR
-//   startwpar – start a previously created WPAR
-//   stopwpar  – stop a running WPAR
-//   rmwpar    – destroy a WPAR
-//   lswpar    – query WPAR state
+//	mkwpar    – create a new WPAR
+//	startwpar – start a previously created WPAR
+//	stopwpar  – stop a running WPAR
+//	rmwpar    – destroy a WPAR
+//	lswpar    – query WPAR state
 //
-// Process execution inside WPARs uses clogin(1) -R.
+// Process execution inside WPARs uses clogin(1).
 package wpar
 
 import (
@@ -40,6 +40,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -312,18 +313,31 @@ func (w *WPAR) saveState() error {
 	return os.WriteFile(statePath(w.bundlePath), data, 0600)
 }
 
+// wparTemplateDir is the directory that holds the pre-built WPAR template
+// used by the fast-clone (-p) path.  It is configurable; the default matches
+// the recipe from the validation notes.
+const wparTemplateDir = "/wpars/.template"
+
 // Create allocates the WPAR via mkwpar.
 //
-// We use "mkwpar -n NAME -d BASEDIR -M directory=/ vfs=directory" which makes
-// "/" a plain directory mount instead of a new logical volume, then copy the
-// image rootfs in with pax. This avoids the ~8-minute populate overhead.
+// Fast path (mkwpar -p): if a pre-built template directory exists at
+// wparTemplateDir, we copy it into the per-WPAR directory and then call
+// "mkwpar -n NAME -p NAME" which attaches the existing /etc/filesystems
+// stanzas and skips the costly populate step (~1 s vs ~8 min).
 //
-// mkwpar constraints:
-//   - The -d base directory must be empty (not the image rootfs directly).
-//   - The parent of -d must be mode 0700.
+// Slow path (fallback): if no template exists, we fall back to the
+// traditional "mkwpar -n NAME -d BASEDIR -M directory=/ -M vfs=directory"
+// invocation followed by a pax rootfs copy.  This path works on a fresh box
+// but takes ~8 minutes per WPAR.
+//
+// mkwpar constraints (both paths):
+//   - The -d base directory must be empty; mkwpar creates it itself.
+//   - The parent of -d must exist with mode 0700.
 //   - WPAR names are at most 25 bytes and must not start with a digit.
 //   - Do NOT pass -N (that is the network flag, not "don't start").
 //   - mkwpar does not start the WPAR unless given -s.
+//   - -M flags must be separate words: "-M" "directory=/" "-M" "vfs=directory"
+//     (not a single "-M" "directory=/ vfs=directory" argument).
 func (w *WPAR) Create(ctx context.Context) error {
 	w.mu.Lock()
 	if w.state != StateDown {
@@ -332,27 +346,69 @@ func (w *WPAR) Create(ctx context.Context) error {
 	}
 	w.mu.Unlock()
 
-	// The base directory for the WPAR must be empty.
-	// We create a dedicated base directory alongside rootdir.
-	baseDir := w.rootdir + "-wpar"
-	if err := os.MkdirAll(filepath.Dir(baseDir), 0700); err != nil {
-		return fmt.Errorf("create wpar parent dir: %w", err)
+	if _, err := os.Stat(wparTemplateDir); err == nil {
+		return w.createFast(ctx)
 	}
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return fmt.Errorf("create wpar base dir: %w", err)
+	return w.createSlow(ctx)
+}
+
+// createFast implements the mkwpar -p fast-clone path.
+//
+// Steps (from the validation notes performance section):
+//  1. Copy the template directory tree into /wpars/NAME (~1 s for 3,250 files).
+//  2. Run "mkwpar -n NAME -p NAME" — attaches the existing /etc/filesystems
+//     stanzas from the template copy; skips populate entirely (~1 s).
+//  3. The image rootfs is still copied in by the caller via pax.
+//
+// Teardown: rmwpar -F takes ~0.6 s (no LVs to remove).  The directory is left
+// behind by rmwpar and must be removed separately (done in Delete).
+func (w *WPAR) createFast(ctx context.Context) error {
+	// The WPAR base directory lives in /wpars/NAME.  mkwpar -p does NOT create
+	// it — we must copy the template first.
+	baseDir := "/wpars/" + w.name
+
+	// Ensure /wpars exists and has mode 0700 (required by mkwpar).
+	if err := os.MkdirAll("/wpars", 0700); err != nil {
+		return fmt.Errorf("create /wpars: %w", err)
 	}
 
-	// mkwpar -n NAME -d BASEDIR -M directory=/ vfs=directory
-	// This creates the WPAR with "/" as a plain directory mount (no LV).
-	// The image contents must be copied in separately (done by the shim's
-	// Create caller before calling us — rootdir contains the unpacked rootfs).
-	args := []string{"-n", w.name, "-d", baseDir, "-M", "directory=/ vfs=directory"}
+	// Copy the template.  pax -rw -pe requires the destination to exist.
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return fmt.Errorf("create wpar base dir %s: %w", baseDir, err)
+	}
+	if err := copyRootfs(ctx, wparTemplateDir, baseDir); err != nil {
+		return fmt.Errorf("copy wpar template: %w", err)
+	}
+
+	// Copy the container image rootfs on top of the template.
+	if err := copyRootfs(ctx, w.rootdir, baseDir); err != nil {
+		return fmt.Errorf("copy image rootfs into wpar: %w", err)
+	}
+
+	// mkwpar -n NAME -p NAME: attach existing /etc/filesystems stanzas.
+	// -p takes the WPAR name whose stanzas already exist in /etc/filesystems
+	// (populated when we copied the template).
+	if err := runCmdAt(ctx, "/", "mkwpar", "-n", w.name, "-p", w.name); err != nil {
+		return fmt.Errorf("mkwpar -p: %w", err)
+	}
+
+	return w.saveState()
+}
+
+// createSlow implements the traditional mkwpar path (no pre-built template).
+func (w *WPAR) createSlow(ctx context.Context) error {
+	// mkwpar creates the base directory itself; the parent must be mode 0700.
+	baseDir := "/wpars/" + w.name
+	if err := os.MkdirAll("/wpars", 0700); err != nil {
+		return fmt.Errorf("create /wpars: %w", err)
+	}
+
+	// -M flags must be separate arguments (not a single "directory=/ vfs=directory" word).
+	args := []string{"-n", w.name, "-d", baseDir, "-M", "directory=/", "-M", "vfs=directory"}
 	if err := runCmdAt(ctx, "/", "mkwpar", args...); err != nil {
 		return fmt.Errorf("mkwpar: %w", err)
 	}
 
-	// Copy the image rootfs into the WPAR's base directory with pax.
-	// pax -rw -pe requires the destination to exist (it does: baseDir).
 	if err := copyRootfs(ctx, w.rootdir, baseDir); err != nil {
 		return fmt.Errorf("copy rootfs to wpar base: %w", err)
 	}
@@ -377,9 +433,6 @@ func copyRootfs(ctx context.Context, src, dst string) error {
 // Start activates the WPAR via startwpar, then launches the container process
 // via clogin(1) inside the running WPAR.
 func (w *WPAR) Start(ctx context.Context, specArgs []string, specEnv []string, specCwd string, stdoutFIFO, stderrFIFO string) error {
-	w.mu.Lock()
-	w.mu.Unlock()
-
 	if err := runCmdAt(ctx, "/", "startwpar", w.name); err != nil {
 		return fmt.Errorf("startwpar: %w", err)
 	}
@@ -411,47 +464,47 @@ func (w *WPAR) Start(ctx context.Context, specArgs []string, specEnv []string, s
 // It returns the PID of the clogin process (used as the task PID).
 //
 // clogin quirks (from the test report):
+//   - "clogin NAME CMD" — NOT "clogin -R NAME CMD" (-R is for WPAR name, but
+//     the correct form without flags is simply "clogin NAME CMD").
 //   - clogin joins all arguments into one string and passes it to a shell.
 //     Every argument must be shell-quoted.
+//   - The process must NOT be started with exec.CommandContext because ttrpc
+//     cancels the request context as soon as the Start handler returns, which
+//     would deliver SIGKILL to clogin immediately.  Use exec.Command instead
+//     and manage the lifetime explicitly.
 //   - stdin does not pass through (the program inside gets EBADF). We connect
 //     /dev/null.
 //   - We wire stdout and stderr to containerd's FIFOs.
 //   - clogin passes the exit code through; for signal death we report 128+sig.
-func (w *WPAR) runProcess(ctx context.Context, args []string, env []string, cwd string, stdoutFIFO, stderrFIFO string) (uint32, error) {
+func (w *WPAR) runProcess(_ context.Context, args []string, env []string, cwd string, stdoutFIFO, stderrFIFO string) (uint32, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("runProcess: no command specified")
 	}
 
-	// Build the shell command: "env VAR=VAL ... sh -c 'cd CWD && CMD ARGS...'"
-	// We shell-quote every argument individually.
+	// Build: cd '<cwd>' && exec /usr/bin/env -i 'K=V'... 'arg0' 'arg1'...
+	// env -i keeps the shim's own environment out of the container.
 	var shellCmd strings.Builder
-
-	// Set environment variables before the command.
-	for _, e := range env {
-		shellCmd.WriteString(shellQuote(e))
-		shellCmd.WriteByte(' ')
-	}
-
-	// Change working directory if specified.
 	if cwd != "" {
 		shellCmd.WriteString("cd ")
 		shellCmd.WriteString(shellQuote(cwd))
 		shellCmd.WriteString(" && ")
 	}
-
-	for i, a := range args {
-		if i > 0 {
-			shellCmd.WriteByte(' ')
-		}
+	shellCmd.WriteString("exec /usr/bin/env -i")
+	for _, e := range env {
+		shellCmd.WriteByte(' ')
+		shellCmd.WriteString(shellQuote(e))
+	}
+	for _, a := range args {
+		shellCmd.WriteByte(' ')
 		shellCmd.WriteString(shellQuote(a))
 	}
 
-	// clogin -R WPAR SHELLCMD
-	cloginArgs := []string{"-R", w.name, shellCmd.String()}
-
-	cmd := exec.CommandContext(ctx, "clogin", cloginArgs...)
+	// clogin NAME SHELLCMD  (no -R flag)
+	// Do NOT use exec.CommandContext here: ttrpc cancels the Start handler's
+	// context on return, which would immediately SIGKILL the clogin process.
+	cmd := exec.Command("clogin", w.name, shellCmd.String()) //nolint:gosec
 	cmd.Dir = "/"
-	cmd.Stdin = nil // /dev/null inherited from process
+	cmd.Stdin = nil // /dev/null inherited from the process
 
 	// Wire stdout/stderr to containerd's FIFOs.
 	if stdoutFIFO != "" {
@@ -477,23 +530,25 @@ func (w *WPAR) runProcess(ctx context.Context, args []string, env []string, cwd 
 
 	pid := uint32(cmd.Process.Pid)
 
-	// Wait for clogin in the background; close the WPAR watchers when done.
-	go w.waitForProcess(ctx, cmd)
+	// Wait for clogin in the background; close the WPAR waiters when done.
+	go w.waitForProcess(cmd)
 
 	return pid, nil
 }
 
 // waitForProcess waits for the clogin process to exit, records the exit code,
 // and notifies all waiters.
-func (w *WPAR) waitForProcess(ctx context.Context, cmd *exec.Cmd) {
+func (w *WPAR) waitForProcess(cmd *exec.Cmd) {
 	err := cmd.Wait()
 
 	var exitCode uint32
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			// For signal death, report 128 + signal number.
-			if status, ok := exitErr.Sys().(interface{ Signal() int }); ok {
-				exitCode = uint32(128 + status.Signal())
+			// Use syscall.WaitStatus.Signaled() to detect signal death.
+			// exitErr.Sys().(interface{ Signal() int }) never matches on AIX
+			// because syscall.WaitStatus.Signal() returns syscall.Signal, not int.
+			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				exitCode = uint32(128 + ws.Signal())
 			} else {
 				exitCode = uint32(exitErr.ExitCode())
 			}
@@ -514,8 +569,6 @@ func (w *WPAR) waitForProcess(ctx context.Context, cmd *exec.Cmd) {
 	for _, ch := range waiters {
 		close(ch)
 	}
-
-	log.G(ctx).WithField("id", w.id).WithField("exit_code", exitCode).Debug("wpar: container process exited")
 }
 
 // shellQuote returns a safely shell-quoted version of s using single quotes.

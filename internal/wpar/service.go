@@ -272,10 +272,17 @@ func (s *Service) Connect(ctx context.Context, r *shimapi.ConnectRequest) (*shim
 	}, nil
 }
 
-// Shutdown stops the shim process after all tasks are gone.
+// Shutdown stops the shim process.  It is a no-op while any tasks remain
+// (matches the runc shim behaviour — the shim must not exit while a pod's
+// sandbox and containers share the same process).
 func (s *Service) Shutdown(ctx context.Context, r *shimapi.ShutdownRequest) (*emptypb.Empty, error) {
 	log.G(ctx).Debug("wpar: Shutdown")
-	s.sd.Shutdown()
+	s.mu.Lock()
+	remaining := len(s.wpars)
+	s.mu.Unlock()
+	if remaining == 0 {
+		s.sd.Shutdown()
+	}
 	return &emptypb.Empty{}, nil
 }
 
