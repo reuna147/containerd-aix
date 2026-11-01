@@ -46,6 +46,8 @@ import (
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/moby/sys/mountinfo"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/containerd/containerd/v2/core/runtime"
@@ -83,16 +85,28 @@ type wparStateFile struct {
 	ExitedAt time.Time `json:"exited_at,omitempty"`
 	// RootDir is the directory we unpacked the image into.
 	RootDir string `json:"root_dir,omitempty"`
+	// Wpool is the log=NULL copy directory (/wpool/NAME) used by fast-clone.
+	Wpool string `json:"wpool,omitempty"`
 }
 
 // WPAR represents a single managed AIX Workload Partition.
 type WPAR struct {
 	mu sync.Mutex
 
+	// cmdMu serialises WPAR management commands (stopwpar, rmwpar).
+	// Kill acquires it for the duration of stopwpar; Delete acquires it
+	// before starting rmwpar -F.  waitForProcess waits for cmdMu to drain
+	// (by acquiring+releasing) before publishing TaskExit, so containerd
+	// cannot call Delete until any in-flight stopwpar has returned.
+	cmdMu sync.Mutex
+
 	id         string // containerd task ID
 	name       string // AIX WPAR name (max 25 chars, derived from id)
 	bundlePath string
 	rootdir    string
+	// wpool is the log=NULL copy directory used by the fast-clone path
+	// (/wpool/NAME).  Empty on the slow path.
+	wpool string
 
 	pid      uint32
 	state    State
@@ -191,6 +205,7 @@ func LoadWPAR(bundlePath string) (*WPAR, error) {
 		name:       wparName(sf.ID),
 		bundlePath: bundlePath,
 		rootdir:    sf.RootDir,
+		wpool:      sf.Wpool,
 		pid:        sf.Pid,
 		exitCode:   sf.ExitCode,
 		exitedAt:   sf.ExitedAt,
@@ -313,6 +328,7 @@ func (w *WPAR) saveState() error {
 		ExitCode: w.exitCode,
 		ExitedAt: w.exitedAt,
 		RootDir:  w.rootdir,
+		Wpool:    w.wpool,
 	}
 	w.mu.Unlock()
 
@@ -323,10 +339,15 @@ func (w *WPAR) saveState() error {
 	return os.WriteFile(statePath(w.bundlePath), data, 0600)
 }
 
-// wparTemplateDir is the directory that holds the pre-built WPAR template
-// used by the fast-clone (-p) path.  It is configurable; the default matches
-// the recipe from the validation notes.
+// wparTemplateDir is the sentinel directory whose existence triggers the
+// fast-clone path.  The template itself lives here.
 const wparTemplateDir = "/wpars/.template"
+
+// wpoolBase is the log=NULL file system used by the fast-clone path.
+// Copies go into /wpool/NAME; this is mounted on its own file system so the
+// pax copy runs at disk speed (~1 s) rather than through the journal (~2 min).
+// rmwpar leaves /wpool/NAME behind; Delete removes it.
+const wpoolBase = "/wpool"
 
 // Create allocates the WPAR via mkwpar.
 //
@@ -365,44 +386,53 @@ func (w *WPAR) Create(ctx context.Context) error {
 // createFast implements the mkwpar -p fast-clone path.
 //
 // Steps (from the validation notes performance section):
-//  1. Copy the template directory tree into /wpars/NAME (~1 s for 3,250 files).
-//  2. Write four /etc/filesystems stanzas for the new WPAR's name. mkwpar -p
-//     attaches existing stanzas keyed by WPAR name — if they don't exist,
-//     mkwpar -p fails or builds the wrong thing.
-//  3. Run "mkwpar -n NAME -p NAME" (~1 s). Skips populate entirely.
+//  1. Create /wpool/NAME on the log=NULL file system (~1 s for 3,250 files).
+//  2. Copy the template directory tree into /wpool/NAME.
+//  3. Copy the container image rootfs on top of the template.
+//  4. Write four /etc/filesystems stanzas keyed by /wpars/NAME mount points,
+//     with the / stanza pointing dev at /wpool/NAME.  mkwpar -p attaches
+//     the stanzas — without them it fails or picks up the template's stanzas.
+//  5. Run "mkwpar -n NAME -p NAME" (~2 s).  Skips populate entirely.
 //
-// Teardown: rmwpar -F takes ~0.6 s (no LVs to remove). The directory is left
-// behind by rmwpar and removed by Delete.
+// Teardown: rmwpar -F removes the kernel WPAR registration and its mounts
+// (~0.6 s).  It leaves /wpool/NAME behind; Delete removes it.
 func (w *WPAR) createFast(ctx context.Context) error {
-	baseDir := "/wpars/" + w.name
+	wpoolDir := wpoolBase + "/" + w.name
 
-	if err := os.MkdirAll("/wpars", 0700); err != nil {
-		return fmt.Errorf("create /wpars: %w", err)
+	if err := os.MkdirAll(wpoolBase, 0755); err != nil {
+		return fmt.Errorf("create %s: %w", wpoolBase, err)
 	}
-
 	// pax -rw -pe requires the destination to exist.
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return fmt.Errorf("create wpar base dir %s: %w", baseDir, err)
+	if err := os.MkdirAll(wpoolDir, 0755); err != nil {
+		return fmt.Errorf("create wpool dir %s: %w", wpoolDir, err)
 	}
-	if err := copyRootfs(ctx, wparTemplateDir, baseDir); err != nil {
+
+	// Copy template then overlay the container image rootfs.
+	if err := copyRootfs(ctx, wparTemplateDir, wpoolDir); err != nil {
+		_ = os.RemoveAll(wpoolDir)
 		return fmt.Errorf("copy wpar template: %w", err)
 	}
-
-	// Copy the container image rootfs on top of the template.
-	if err := copyRootfs(ctx, w.rootdir, baseDir); err != nil {
-		return fmt.Errorf("copy image rootfs into wpar: %w", err)
+	if err := copyRootfs(ctx, w.rootdir, wpoolDir); err != nil {
+		_ = os.RemoveAll(wpoolDir)
+		return fmt.Errorf("copy image rootfs into wpool: %w", err)
 	}
 
+	// Record wpool so Delete can clean it up even after a shim restart.
+	w.mu.Lock()
+	w.wpool = wpoolDir
+	w.mu.Unlock()
+
 	// Write /etc/filesystems stanzas for this WPAR before mkwpar -p.
-	// mkwpar -p looks up stanzas by WPAR name; copying the directory does not
-	// create them — they must be appended to /etc/filesystems explicitly.
-	if err := w.writeFilesystemsStanzas(baseDir); err != nil {
+	// The / stanza's dev points at wpoolDir (the log=NULL copy, not /wpars/NAME).
+	if err := w.writeFilesystemsStanzas(wpoolDir); err != nil {
+		_ = os.RemoveAll(wpoolDir)
 		return fmt.Errorf("write /etc/filesystems stanzas: %w", err)
 	}
 
 	// mkwpar -n NAME -p NAME: attach the stanzas we just wrote.
 	if err := runCmdAt(ctx, "/", "mkwpar", "-n", w.name, "-p", w.name); err != nil {
 		_ = w.removeFilesystemsStanzas()
+		_ = os.RemoveAll(wpoolDir)
 		return fmt.Errorf("mkwpar -p: %w", err)
 	}
 
@@ -412,25 +442,22 @@ func (w *WPAR) createFast(ctx context.Context) error {
 // writeFilesystemsStanzas appends the four required /etc/filesystems stanzas
 // for the new WPAR to the host's /etc/filesystems file.
 //
-// The stanzas mirror the standard WPAR layout:
-//   - /           as namefs (rw) over baseDir
-//   - /usr        as namefs (ro) from the host
-//   - /opt        as namefs (ro) from the host
-//   - /proc       as procfs
+// The stanzas mirror the layout written by a normal mkwpar:
+//   - /     namefs (rw) over baseDir (the /wpool/NAME copy on fast path)
+//   - /usr  namefs (ro) from the host
+//   - /opt  namefs (ro) from the host
+//   - /proc namefs (rw) over /proc  — NOT procfs; mkwpar writes namefs here
 //
 // mkwpar -p skips all file system creation and the costly populate step; it
 // only calls into the kernel to register the WPAR against the stanzas it
 // finds in /etc/filesystems. Without this step, -p either fails or attaches
 // the template's stanzas (which point to the wrong directory).
 func (w *WPAR) writeFilesystemsStanzas(baseDir string) error {
-	// Stanza names must be full mount-point paths so that mkwpar -p and rmwpar
-	// can locate them.  The "type" field must be the WPAR name (not "wpar") so
-	// that rmwpar recognises and cleans up the stanzas.  "mount = true" means
-	// "mount at boot from the global environment", which is wrong for WPAR
-	// stanzas — omit it.
+	// Stanza names are full mount-point paths so mkwpar -p and rmwpar find them.
+	// type = WPAR name so rmwpar recognises and removes them on delete.
+	// mount = true would mean "mount at boot from global env" — omit it.
 	mp := "/wpars/" + w.name
-	stanzas := "\n" +
-		mp + ":\n" +
+	stanzas := mp + ":\n" +
 		"\tdev\t\t= " + baseDir + "\n" +
 		"\tvfs\t\t= namefs\n" +
 		"\ttype\t\t= " + w.name + "\n" +
@@ -449,8 +476,9 @@ func (w *WPAR) writeFilesystemsStanzas(baseDir string) error {
 		"\n" +
 		mp + "/proc:\n" +
 		"\tdev\t\t= /proc\n" +
-		"\tvfs\t\t= procfs\n" +
+		"\tvfs\t\t= namefs\n" +
 		"\ttype\t\t= " + w.name + "\n" +
+		"\toptions\t\t= rw\n" +
 		"\n"
 
 	return writeFilesystemsAtomic(stanzas)
@@ -464,7 +492,7 @@ func (w *WPAR) removeFilesystemsStanzas() error {
 	return rewriteFilesystemsAtomic(func(line string) bool {
 		// A stanza header for this WPAR starts with the full mount-point path
 		// followed by ':'.  Skip the header and all indented attribute lines.
-		return strings.HasPrefix(line, prefix+":")  ||
+		return strings.HasPrefix(line, prefix+":") ||
 			strings.HasPrefix(line, prefix+"/")
 	})
 }
@@ -486,27 +514,35 @@ func splitLines(s string) []string {
 }
 
 const etcFilesystems = "/etc/filesystems"
-const etcFilesystemsLock = "/etc/filesystems.lock"
 
-// writeFilesystemsAtomic appends stanzas to /etc/filesystems under an
-// exclusive lock file, then rewrites atomically via a temp file + rename.
-// This prevents interleaved writes when multiple shim processes start at the
-// same time.
+// writeFilesystemsAtomic appends stanzas to /etc/filesystems under a POSIX
+// advisory lock (fcntl F_SETLKW), then rewrites atomically via a temp file +
+// rename.  The lock is held on /etc/filesystems.lck (a file that is never
+// deleted so the lock descriptor survives shim restarts).  The kernel releases
+// it automatically when the process exits, so a crashed shim cannot strand it.
+//
+// Note: mkwpar/rmwpar/crfs/chfs do NOT use this lock.  A concurrent AIX tool
+// write can still race, though this is less likely than shim-against-shim.
 func writeFilesystemsAtomic(stanzas string) error {
 	return modifyFilesystemsAtomic(func(data []byte) ([]byte, error) {
-		return append(data, []byte(stanzas)...), nil
+		// Trim trailing blank lines, then append one blank separator before
+		// the new stanzas.  This prevents blank lines from accumulating across
+		// multiple Create calls.
+		trimmed := strings.TrimRight(string(data), "\n")
+		return []byte(trimmed + "\n\n" + stanzas), nil
 	})
 }
 
 // rewriteFilesystemsAtomic removes all stanzas whose header line satisfies
 // isHeader from /etc/filesystems, under a lock.  A stanza consists of its
-// header line and any immediately following tab-indented lines.
+// header line and any immediately following whitespace-indented lines
+// (tab or space, to cope with tools that rewrite with spaces).
 func rewriteFilesystemsAtomic(isHeader func(string) bool) error {
 	return modifyFilesystemsAtomic(func(data []byte) ([]byte, error) {
 		var out []byte
 		skip := false
 		for _, line := range splitLines(string(data)) {
-			if len(line) > 0 && line[0] != '\t' {
+			if len(line) > 0 && line[0] != '\t' && line[0] != ' ' {
 				// Non-indented line: a stanza header (or blank separator).
 				skip = isHeader(line)
 			}
@@ -518,32 +554,31 @@ func rewriteFilesystemsAtomic(isHeader func(string) bool) error {
 	})
 }
 
-// modifyFilesystemsAtomic holds a lock on etcFilesystemsLock, reads
-// etcFilesystems, passes its contents to fn, and writes fn's result back
-// via an atomic rename.
+// modifyFilesystemsAtomic acquires a POSIX write lock on etcFilesystems+".lck"
+// (created once, never deleted), reads etcFilesystems, calls fn, and writes
+// the result back via an atomic rename.  The lock is released when the
+// returned file descriptor is closed (or the process exits).
 func modifyFilesystemsAtomic(fn func([]byte) ([]byte, error)) error {
-	// Acquire a lock via O_EXCL on a sibling lock file.
-	const maxRetries = 20
-	const retryDelay = 50 * time.Millisecond
-	var lock *os.File
-	var err error
-	for i := 0; i < maxRetries; i++ {
-		lock, err = os.OpenFile(etcFilesystemsLock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err == nil {
-			break
-		}
-		if !os.IsExist(err) {
-			return fmt.Errorf("acquire /etc/filesystems lock: %w", err)
-		}
-		time.Sleep(retryDelay)
-	}
+	const lockPath = etcFilesystems + ".lck"
+
+	// Open (or create) the companion lock file.  We never delete it so that
+	// processes that already hold an fd to it don't lose their lock.
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
-		return fmt.Errorf("acquire /etc/filesystems lock after retries: %w", err)
+		return fmt.Errorf("open /etc/filesystems lock file: %w", err)
 	}
-	defer func() {
-		lock.Close()
-		os.Remove(etcFilesystemsLock)
-	}()
+	defer lf.Close()
+
+	// F_SETLKW: blocking exclusive write lock; kernel releases on process exit.
+	lk := unix.Flock_t{
+		Type:   unix.F_WRLCK,
+		Whence: int16(0), // SEEK_SET
+		Start:  0,
+		Len:    0, // entire file
+	}
+	if err := unix.FcntlFlock(lf.Fd(), unix.F_SETLKW, &lk); err != nil {
+		return fmt.Errorf("lock /etc/filesystems: %w", err)
+	}
 
 	data, err := os.ReadFile(etcFilesystems)
 	if err != nil {
@@ -555,8 +590,15 @@ func modifyFilesystemsAtomic(fn func([]byte) ([]byte, error)) error {
 		return err
 	}
 
+	// Preserve the original mode (AIX ships /etc/filesystems as 0664).
+	fi, err := os.Stat(etcFilesystems)
+	mode := os.FileMode(0664)
+	if err == nil {
+		mode = fi.Mode().Perm()
+	}
+
 	tmp := etcFilesystems + ".tmp"
-	if err := os.WriteFile(tmp, newData, 0644); err != nil {
+	if err := os.WriteFile(tmp, newData, mode); err != nil {
 		return fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, etcFilesystems); err != nil {
@@ -565,8 +607,6 @@ func modifyFilesystemsAtomic(fn func([]byte) ([]byte, error)) error {
 	}
 	return nil
 }
-
-
 
 // createSlow implements the traditional mkwpar path (no pre-built template).
 func (w *WPAR) createSlow(ctx context.Context) error {
@@ -746,6 +786,15 @@ func (w *WPAR) waitForProcess(cmd *exec.Cmd, publisher shim.Publisher, pubCtx co
 
 	_ = w.saveState()
 
+	// Wait for any in-flight Kill (stopwpar) to finish before publishing
+	// TaskExit.  Without this, containerd receives TaskExit while stopwpar is
+	// still running, calls Delete immediately, and Delete's rmwpar -F collides
+	// with the in-flight stopwpar ("wparlockctl failed, rc 2").
+	// cmdMu is held by Kill for the duration of stopwpar; acquiring it here
+	// guarantees stopwpar has returned before TaskExit is published.
+	w.cmdMu.Lock()
+	w.cmdMu.Unlock() //nolint:staticcheck // intentional drain
+
 	// Publish the TaskExit event. Without this, ctr run never returns and
 	// CRI never learns that the container exited.
 	if publisher != nil {
@@ -782,8 +831,22 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
-// Kill sends a signal to the WPAR. SIGKILL / SIGTERM stop the whole partition;
-// other signals are forwarded to the clogin process.
+// Kill sends a signal to the WPAR.
+//
+// SIGKILL → stopwpar -F (immediate force-stop; equivalent to sending SIGKILL
+// to every process in the partition).
+// SIGTERM → stopwpar (graceful stop; sends SIGTERM to the WPAR's init process
+// and waits up to 90 s by default).
+// Other signals are delivered to the clogin process directly. This works for
+// signals that the container's process traps (e.g. SIGHUP, SIGUSR1/2), because
+// clogin is the direct parent and is in the global root. For SIGINT this
+// kills the clogin process rather than routing INT into the WPAR; a
+// full fix requires finding the container's PID under clogin.
+//
+// cmdMu serialises WPAR management commands so that a concurrent Delete cannot
+// start rmwpar -F while stopwpar is still running (which causes "wparlockctl
+// failed, rc 2").  waitForProcess waits for cmdMu before publishing TaskExit,
+// ensuring containerd cannot call Delete until stopwpar has returned.
 func (w *WPAR) Kill(ctx context.Context, signal uint32, all bool) error {
 	w.mu.Lock()
 	state := w.state
@@ -794,30 +857,43 @@ func (w *WPAR) Kill(ctx context.Context, signal uint32, all bool) error {
 		return errdefs.ErrNotFound
 	}
 
-	// For SIGKILL / SIGTERM, stop the whole partition — the watchUntilDown
-	// goroutine (or waitForProcess) will see the process exit and notify waiters.
 	const sigkill = 9
 	const sigterm = 15
-	if signal == sigkill || signal == sigterm {
-		if err := runCmdAt(ctx, "/", "stopwpar", name); err != nil {
+
+	switch signal {
+	case sigkill:
+		// Force-stop: stopwpar -F does an immediate SIGKILL to all processes.
+		w.cmdMu.Lock()
+		err := runCmdAt(ctx, "/", "stopwpar", "-F", name)
+		w.cmdMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("stopwpar -F: %w", err)
+		}
+		return nil
+	case sigterm:
+		// Graceful stop.
+		w.cmdMu.Lock()
+		err := runCmdAt(ctx, "/", "stopwpar", name)
+		w.cmdMu.Unlock()
+		if err != nil {
 			return fmt.Errorf("stopwpar: %w", err)
 		}
 		return nil
+	default:
+		// Forward other signals to the clogin/init process directly.
+		w.mu.Lock()
+		pid := w.pid
+		w.mu.Unlock()
+		if pid == 0 {
+			return fmt.Errorf("no known PID for WPAR %s", name)
+		}
+		p, err := os.FindProcess(int(pid))
+		if err != nil {
+			return err
+		}
+		// syscall.Signal is an int on AIX.
+		return p.Signal(syscallSignal(signal))
 	}
-
-	// Forward other signals to the clogin/init process directly.
-	w.mu.Lock()
-	pid := w.pid
-	w.mu.Unlock()
-	if pid == 0 {
-		return fmt.Errorf("no known PID for WPAR %s", name)
-	}
-	p, err := os.FindProcess(int(pid))
-	if err != nil {
-		return err
-	}
-	// syscall.Signal is an int on AIX.
-	return p.Signal(syscallSignal(signal))
 }
 
 // Stop issues stopwpar. We do NOT call this before rmwpar — rmwpar -F does its
@@ -834,37 +910,87 @@ func (w *WPAR) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Delete destroys the WPAR via rmwpar -F and removes the persisted state file.
-// All WPAR commands run from "/" (issue 16) and with a background context that
-// ignores the caller's cancellation (issue 15).
+// Delete destroys the WPAR asynchronously and removes the persisted state file.
+//
+// rmwpar -F is run in a detached background goroutine so Delete returns before
+// CRI's 10 s RPC deadline.  It acquires cmdMu before starting rmwpar so it
+// cannot collide with an in-flight stopwpar from Kill.
+//
+// The base directory (/wpars/NAME) and the wpool copy (/wpool/NAME) are only
+// removed once lswpar confirms the WPAR no longer exists.  "No longer exists"
+// means lswpar returns an error (WPAR not found) — every state code including
+// Broken (B) and transitional (T) means it still occupies the directory tree.
 func (w *WPAR) Delete(ctx context.Context) error {
 	w.mu.Lock()
 	name := w.name
 	baseDir := "/wpars/" + w.name
+	wpoolDir := w.wpool
+	statFile := statePath(w.bundlePath)
 	w.mu.Unlock()
 
-	// rmwpar -F does its own stop — do NOT stopwpar first (double stop breaks
-	// things). Run from "/" so it does not inherit the bundle dir.
-	bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// Remove the state file immediately so the shim does not try to reload a
+	// partially deleted WPAR on restart.
+	_ = os.Remove(statFile)
 
-	if err := runCmdAt(bgCtx, "/", "rmwpar", "-F", name); err != nil {
-		// If the WPAR is already gone, that is fine.
-		log.G(ctx).WithError(err).Warn("wpar: rmwpar -F; WPAR may already be gone")
-	}
+	// Release any waiters blocked in Wait() so they don't leak goroutines.
+	w.releaseWaiters()
 
-	// Only remove the base directory once lswpar confirms the WPAR is gone.
-	// If rmwpar failed the WPAR may still be running with that directory as its
-	// root; removing it while live would corrupt the running partition and, for
-	// hostPath volumes, delete host data.
-	if s, err := lswparState(name); err == nil && s == StateActive {
-		log.G(ctx).Warn("wpar: WPAR still active after rmwpar -F; skipping base directory removal")
-	} else {
-		_ = os.RemoveAll(baseDir)
-	}
+	// Run rmwpar -F in the background.  We hold cmdMu for the duration so
+	// Kill (stopwpar) cannot run concurrently.
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
 
-	_ = os.Remove(statePath(w.bundlePath))
+		w.cmdMu.Lock()
+		err := runCmdAt(bgCtx, "/", "rmwpar", "-F", name)
+		w.cmdMu.Unlock()
+		if err != nil {
+			log.G(bgCtx).WithError(err).Warn("wpar: rmwpar -F failed; WPAR may already be gone")
+		}
+
+		// Only remove directories once lswpar confirms the WPAR is gone.
+		// An lswpar error (not found) is the success case.  Any listed state
+		// (A, B, T, D …) means the WPAR still exists and still owns the tree.
+		if _, err := lswparState(name); err == nil {
+			log.G(bgCtx).Warn("wpar: WPAR still registered after rmwpar -F; skipping directory removal")
+			return
+		}
+
+		// Confirm nothing is still mounted under baseDir before removing it.
+		if hasMounts, merr := pathHasMounts(baseDir); merr != nil || hasMounts {
+			if merr != nil {
+				log.G(bgCtx).WithError(merr).Warn("wpar: mountinfo check failed; skipping base dir removal")
+			} else {
+				log.G(bgCtx).Warn("wpar: mounts still present under base dir; skipping removal")
+			}
+		} else {
+			_ = os.RemoveAll(baseDir)
+		}
+
+		// Remove the wpool copy (fast-clone path only).
+		if wpoolDir != "" {
+			_ = os.RemoveAll(wpoolDir)
+		}
+	}()
+
 	return nil
+}
+
+// pathHasMounts reports whether any mount point in the system mount table is
+// rooted under path (i.e. path is a prefix of the mount point).
+func pathHasMounts(path string) (bool, error) {
+	entries, err := mountinfo.GetMounts(nil)
+	if err != nil {
+		return false, err
+	}
+	prefix := strings.TrimRight(path, "/") + "/"
+	for _, e := range entries {
+		mp := strings.TrimRight(e.Mountpoint, "/") + "/"
+		if strings.HasPrefix(mp, prefix) || e.Mountpoint == path {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Wait returns a channel that is closed when the WPAR transitions to StateDown.
